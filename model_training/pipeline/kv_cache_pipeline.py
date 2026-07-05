@@ -173,9 +173,9 @@ class ArtifixerKvCachePipeline(ArtifixerPipelineBase):
             neighbor_Ks,
             prompt_embeds,
             num_inference_steps,
-            False,
-            show_progress,
-            progress_bar_leave,
+            use_exit_flag=False,
+            show_progress=show_progress,
+            progress_bar_leave=progress_bar_leave,
         )
 
     @torch.no_grad()
