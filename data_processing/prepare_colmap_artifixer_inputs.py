@@ -432,6 +432,60 @@ def render_frame_count(paths: PreparedPaths, trajectory: PreparedTrajectory | No
     return trajectory_frame_count(transforms_path)
 
 
+def external_render_output_dirs(paths: PreparedPaths) -> tuple[Path, Path]:
+    root = paths.scene_root / "external_renders"
+    return root / "renders", root / "opacity"
+
+
+def write_external_render_request(
+    paths: PreparedPaths,
+    trajectory: PreparedTrajectory | None,
+) -> tuple[Path, Path, int]:
+    request_path = paths.scene_root / "external_render_request.json"
+    frame_count = render_frame_count(paths, trajectory)
+    expected_render_dir, expected_opacity_dir = external_render_output_dirs(paths)
+
+    if trajectory is not None:
+        mode = "trajectory"
+        camera_request_path = trajectory.render_trajectory_path
+        transforms_path = trajectory.transforms_path
+        target_indices_path = trajectory.target_indices_path
+        selected_indices_path = trajectory.selected_indices_path
+        frame_indexing = (
+            "trajectory mode renders target-only frames indexed 0..frame_count-1"
+        )
+    else:
+        mode = "colmap"
+        camera_request_path = paths.threedgrut_input_dir / "nerfstudio/transforms.json"
+        transforms_path = camera_request_path
+        target_indices_path = None
+        selected_indices_path = paths.selected_indices_path
+        frame_indexing = (
+            "non-trajectory mode renders all transforms frames indexed 0..frame_count-1"
+        )
+
+    write_json(
+        request_path,
+        {
+            "scene_id": paths.scene_id,
+            "mode": mode,
+            "frame_count": frame_count,
+            "camera_request_path": scene_relative_path(paths, camera_request_path),
+            "transforms_path": scene_relative_path(paths, transforms_path),
+            "target_indices_path": (
+                scene_relative_path(paths, target_indices_path) if target_indices_path is not None else None
+            ),
+            "selected_indices_path": scene_relative_path(paths, selected_indices_path),
+            "expected_render_dir": scene_relative_path(paths, expected_render_dir),
+            "expected_opacity_dir": scene_relative_path(paths, expected_opacity_dir),
+            "filename_format": "{index:05d}.png",
+            "opacity_format": "grayscale PNG uint8; white=visible, black=empty",
+            "frame_indexing": frame_indexing,
+        },
+    )
+    return request_path, camera_request_path, frame_count
+
+
 def validate_external_render_dirs(render_dir: Path, opacity_dir: Path, frame_count: int) -> None:
     if not render_dir.is_dir():
         raise FileNotFoundError(f"Missing external render directory: {render_dir}")
@@ -897,6 +951,15 @@ def build_parser() -> argparse.ArgumentParser:
             "marks visible rendered content and black marks empty/unknown regions."
         ),
     )
+    parser.add_argument(
+        "--external_render_request_only",
+        action="store_true",
+        default=False,
+        help=(
+            "With --render_backend external, write external_render_request.json describing the required "
+            "RGB/opacity renders and exit without requiring --external_render_dir or --external_opacity_dir."
+        ),
+    )
 
     return parser
 
@@ -917,7 +980,11 @@ def prepare_colmap_scene(args: argparse.Namespace) -> None:
         args.external_render_dir = args.external_render_dir.expanduser().resolve()
     if args.external_opacity_dir is not None:
         args.external_opacity_dir = args.external_opacity_dir.expanduser().resolve()
-    if args.render_backend == "external":
+    if args.external_render_request_only:
+        assert args.render_backend == "external", (
+            "--external_render_request_only requires --render_backend external"
+        )
+    if args.render_backend == "external" and not args.external_render_request_only:
         assert args.external_render_dir is not None, "--external_render_dir is required when --render_backend external"
         assert args.external_opacity_dir is not None, "--external_opacity_dir is required when --render_backend external"
     image_dir, sparse_dir = resolve_colmap_paths(args.colmap_dir)
@@ -929,7 +996,7 @@ def prepare_colmap_scene(args: argparse.Namespace) -> None:
     paths = prepared_paths(args.output_root, args.output_root.name, args.reconstruction_steps)
     paths.scene_root.mkdir(parents=True, exist_ok=True)
 
-    if "prepare" in phases:
+    if "prepare" in phases or (args.external_render_request_only and "render" in phases):
         prepare_files(args, paths, image_dir, sparse_dir, scene, selected_indices)
     if {"reconstruct", "render"} & phases:
         assert (
@@ -940,6 +1007,20 @@ def prepare_colmap_scene(args: argparse.Namespace) -> None:
     if "reconstruct" in phases and args.render_backend == "3dgrut":
         checkpoint_reused = run_reconstruction(args, paths)
     if "render" in phases and args.render_backend == "external":
+        if args.external_render_request_only:
+            trajectory = (
+                write_trajectory_inputs(args, paths, scene, selected_indices)
+                if args.trajectory_path is not None
+                else None
+            )
+            request_path, camera_request_path, frame_count = write_external_render_request(paths, trajectory)
+            expected_render_dir, expected_opacity_dir = external_render_output_dirs(paths)
+            print(f"render_request_path={request_path}", flush=True)
+            print(f"camera_request_path={scene_relative_path(paths, camera_request_path)}", flush=True)
+            print(f"expected_render_dir={scene_relative_path(paths, expected_render_dir)}", flush=True)
+            print(f"expected_opacity_dir={scene_relative_path(paths, expected_opacity_dir)}", flush=True)
+            print(f"frame_count={frame_count}", flush=True)
+            return
         trajectory = (
             write_trajectory_inputs(args, paths, scene, selected_indices)
             if args.trajectory_path is not None
