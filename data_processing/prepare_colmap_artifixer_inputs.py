@@ -432,6 +432,98 @@ def render_frame_count(paths: PreparedPaths, trajectory: PreparedTrajectory | No
     return trajectory_frame_count(transforms_path)
 
 
+def validate_external_render_dirs(render_dir: Path, opacity_dir: Path, frame_count: int) -> None:
+    if not render_dir.is_dir():
+        raise FileNotFoundError(f"Missing external render directory: {render_dir}")
+    if not opacity_dir.is_dir():
+        raise FileNotFoundError(f"Missing external opacity directory: {opacity_dir}")
+
+    required_stems = [f"{index:05d}" for index in range(frame_count)]
+
+    def missing_required(source_dir: Path) -> list[str]:
+        return [stem for stem in required_stems if not (source_dir / f"{stem}.png").is_file()]
+
+    missing_render = missing_required(render_dir)
+    if missing_render:
+        preview = ", ".join(f"{stem}.png" for stem in missing_render[:5])
+        suffix = f" and {len(missing_render) - 5} more" if len(missing_render) > 5 else ""
+        raise FileNotFoundError(
+            f"External render directory {render_dir} is missing {len(missing_render)} of {frame_count} "
+            f"required contiguous frames (e.g. {preview}{suffix})"
+        )
+
+    missing_opacity = missing_required(opacity_dir)
+    if missing_opacity:
+        preview = ", ".join(f"{stem}.png" for stem in missing_opacity[:5])
+        suffix = f" and {len(missing_opacity) - 5} more" if len(missing_opacity) > 5 else ""
+        raise FileNotFoundError(
+            f"External opacity directory {opacity_dir} is missing {len(missing_opacity)} of {frame_count} "
+            f"required contiguous frames (e.g. {preview}{suffix})"
+        )
+
+    render_required = {stem for stem in required_stems if (render_dir / f"{stem}.png").is_file()}
+    opacity_required = {stem for stem in required_stems if (opacity_dir / f"{stem}.png").is_file()}
+    if render_required != opacity_required:
+        only_render = sorted(render_required - opacity_required)
+        only_opacity = sorted(opacity_required - render_required)
+        raise FileNotFoundError(
+            f"External render and opacity directories have mismatched required frames: "
+            f"only in render={only_render[:5]}, only in opacity={only_opacity[:5]}"
+        )
+
+    required_stem_set = set(required_stems)
+    for label, source_dir in (("render", render_dir), ("opacity", opacity_dir)):
+        extra_stems = sorted({path.stem for path in source_dir.glob("*.png")} - required_stem_set)
+        if extra_stems:
+            preview = ", ".join(f"{stem}.png" for stem in extra_stems[:5])
+            suffix = f" and {len(extra_stems) - 5} more" if len(extra_stems) > 5 else ""
+            print(
+                f"Note: ignoring {len(extra_stems)} extra external {label} frame(s) in {source_dir} "
+                f"(e.g. {preview}{suffix})",
+                flush=True,
+            )
+
+
+def stage_external_render_outputs(
+    args: argparse.Namespace,
+    paths: PreparedPaths,
+    trajectory: PreparedTrajectory | None,
+) -> None:
+    assert args.external_render_dir is not None and args.external_opacity_dir is not None
+    render_src = args.external_render_dir.resolve()
+    opacity_src = args.external_opacity_dir.resolve()
+    output_dir = render_checkpoint_dir(paths, trajectory)
+    frame_count = render_frame_count(paths, trajectory)
+    selected_indices_path = (
+        trajectory.selected_indices_path if trajectory is not None else paths.selected_indices_path
+    )
+    expected_selected_indices = selected_indices_for_render(selected_indices_path, None)
+
+    validate_external_render_dirs(render_src, opacity_src, frame_count)
+    if (
+        not args.replace
+        and render_outputs_complete(
+            output_dir,
+            frame_count,
+            expected_selected_indices=expected_selected_indices,
+        )
+    ):
+        print(f"Skipping external render staging; found complete outputs in {output_dir}", flush=True)
+        return
+
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    for name, source_dir in (("renders", render_src), ("opacity", opacity_src)):
+        target_dir = output_dir / name
+        if target_dir.exists():
+            assert target_dir.is_dir() and not target_dir.is_symlink(), f"Expected render output directory, got {target_dir}"
+            shutil.rmtree(target_dir)
+        target_dir.mkdir(parents=True)
+        for index in range(frame_count):
+            (target_dir / f"{index:05d}.png").symlink_to((source_dir / f"{index:05d}.png").resolve())
+
+    shutil.copy2(selected_indices_path, output_dir / "selected_indices.json")
+
+
 def write_eval_split(
     paths: PreparedPaths,
     metric_scale: float,
@@ -779,6 +871,32 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional precomputed metric scale. When omitted, the scale phase runs MoGe alignment.",
     )
+    parser.add_argument(
+        "--render_backend",
+        choices=["3dgrut", "external"],
+        default="3dgrut",
+        help="Render backend for RGB/opacity outputs. Use external to stage pre-rendered images.",
+    )
+    parser.add_argument(
+        "--external_render_dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory of pre-rendered RGB PNG frames named {index:05d}.png (00000.png, 00001.png, ...). "
+            "Required for --render_backend external. Non-trajectory mode expects one frame per "
+            "nerfstudio/transforms.json entry; trajectory mode expects target-only frames from trajectory.json."
+        ),
+    )
+    parser.add_argument(
+        "--external_opacity_dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory of pre-rendered opacity PNG frames named {index:05d}.png, with the same frame count and "
+            "indexing as --external_render_dir. Opacity should be grayscale-compatible uint8 PNG where white "
+            "marks visible rendered content and black marks empty/unknown regions."
+        ),
+    )
 
     return parser
 
@@ -795,6 +913,13 @@ def prepare_colmap_scene(args: argparse.Namespace) -> None:
     if args.trajectory_path is not None:
         args.trajectory_path = args.trajectory_path.expanduser().resolve()
         assert "render" in phases, "--trajectory_path requires the render phase"
+    if args.external_render_dir is not None:
+        args.external_render_dir = args.external_render_dir.expanduser().resolve()
+    if args.external_opacity_dir is not None:
+        args.external_opacity_dir = args.external_opacity_dir.expanduser().resolve()
+    if args.render_backend == "external":
+        assert args.external_render_dir is not None, "--external_render_dir is required when --render_backend external"
+        assert args.external_opacity_dir is not None, "--external_opacity_dir is required when --render_backend external"
     image_dir, sparse_dir = resolve_colmap_paths(args.colmap_dir)
     scene = read_colmap_scene(sparse_dir)
     require_unique_basenames(scene.images)
@@ -812,9 +937,16 @@ def prepare_colmap_scene(args: argparse.Namespace) -> None:
         ), f"Missing prepared selected indices: {paths.selected_indices_path}"
 
     checkpoint_reused = True
-    if "reconstruct" in phases:
+    if "reconstruct" in phases and args.render_backend == "3dgrut":
         checkpoint_reused = run_reconstruction(args, paths)
-    if "render" in phases and args.trajectory_path is None:
+    if "render" in phases and args.render_backend == "external":
+        trajectory = (
+            write_trajectory_inputs(args, paths, scene, selected_indices)
+            if args.trajectory_path is not None
+            else None
+        )
+        stage_external_render_outputs(args, paths, trajectory)
+    elif "render" in phases and args.trajectory_path is None:
         render_reconstruction(args, paths, checkpoint_reused)
         trajectory = None
     elif "render" in phases:
